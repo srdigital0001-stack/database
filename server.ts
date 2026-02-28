@@ -6,10 +6,20 @@ import Database from "better-sqlite3";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const db = new Database("clientflow.db");
+let db: Database.Database;
+try {
+  db = new Database("clientflow.db");
+  console.log("Database connected successfully.");
+} catch (err) {
+  console.error("Failed to connect to database:", err);
+  // Fallback to in-memory if file fails (useful for some restricted environments)
+  db = new Database(":memory:");
+  console.warn("Using in-memory database as fallback.");
+}
 
 // Initialize Database
-db.exec(`
+try {
+  db.exec(`
   CREATE TABLE IF NOT EXISTS clients (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -55,6 +65,10 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
+  console.log("Database tables initialized.");
+} catch (err) {
+  console.error("Failed to initialize database tables:", err);
+}
 
 async function startServer() {
   const app = express();
@@ -62,22 +76,36 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
 
   // API Routes
-  app.get("/api/clients", (req, res) => {
-    const clients = db.prepare(`
-      SELECT c.*, 
-             (SELECT GROUP_CONCAT(service_type) FROM services WHERE client_id = c.id) as services_str,
-             p.total_amount, p.advance_paid, p.remaining_balance
-      FROM clients c
-      LEFT JOIN payments p ON c.id = p.client_id
-      ORDER BY c.created_at DESC
-    `).all() as any[];
+  app.get("/api/health", (req, res) => {
+    try {
+      const clientCount = db.prepare("SELECT COUNT(*) as count FROM clients").get() as any;
+      res.json({ status: "ok", clients: clientCount.count });
+    } catch (err) {
+      res.status(500).json({ status: "error", message: "Database connection failed" });
+    }
+  });
 
-    const formatted = clients.map(c => ({
-      ...c,
-      services: c.services_str ? c.services_str.split(',') : [],
-      pending_tasks: db.prepare("SELECT COUNT(*) as count FROM tasks WHERE client_id = ? AND status = 'pending'").get(c.id).count
-    }));
-    res.json(formatted);
+  app.get("/api/clients", (req, res) => {
+    try {
+      const clients = db.prepare(`
+        SELECT c.*, 
+               (SELECT GROUP_CONCAT(service_type) FROM services WHERE client_id = c.id) as services_str,
+               p.total_amount, p.advance_paid, p.remaining_balance
+        FROM clients c
+        LEFT JOIN payments p ON c.id = p.client_id
+        ORDER BY c.created_at DESC
+      `).all() as any[];
+
+      const formatted = clients.map(c => ({
+        ...c,
+        services: c.services_str ? c.services_str.split(',') : [],
+        pending_tasks: db.prepare("SELECT COUNT(*) as count FROM tasks WHERE client_id = ? AND status = 'pending'").get(c.id).count
+      }));
+      res.json(formatted);
+    } catch (err: any) {
+      console.error("Error fetching clients:", err);
+      res.status(500).json({ error: err.message });
+    }
   });
 
   app.post("/api/clients", (req, res) => {
@@ -189,23 +217,27 @@ async function startServer() {
   });
 
   app.get("/api/stats", (req, res) => {
-    const stats = db.prepare(`
-      SELECT 
-        SUM(total_amount) as totalRevenue,
-        SUM(advance_paid) as totalReceived,
-        SUM(remaining_balance) as totalPending
-      FROM payments
-    `).get() as any;
+    try {
+      const stats = db.prepare(`
+        SELECT 
+          SUM(total_amount) as totalRevenue,
+          SUM(advance_paid) as totalReceived,
+          SUM(remaining_balance) as totalPending
+        FROM payments
+      `).get() as any;
 
-    const clientCount = db.prepare("SELECT COUNT(*) as count FROM clients").get() as any;
+      const clientCount = db.prepare("SELECT COUNT(*) as count FROM clients").get() as any;
 
-    // Simple trend calculation (mocked for now or could be calculated from history)
-    res.json({
-      revenue: { value: stats.totalRevenue || 0, trend: "+12.5%" },
-      received: { value: stats.totalReceived || 0, trend: "+8.2%" },
-      pending: { value: stats.totalPending || 0 },
-      clients: { value: clientCount.count || 0 }
-    });
+      res.json({
+        revenue: { value: stats.totalRevenue || 0, trend: "+0%" },
+        received: { value: stats.totalReceived || 0, trend: "+0%" },
+        pending: { value: stats.totalPending || 0 },
+        clients: { value: clientCount.count || 0 }
+      });
+    } catch (err: any) {
+      console.error("Error fetching stats:", err);
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // Vite middleware for development

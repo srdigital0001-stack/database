@@ -1,0 +1,7 @@
+node_modules
+dist
+clientflow.db
+.git
+.env
+Dockerfile
+.dockerignore

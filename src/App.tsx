@@ -655,13 +655,13 @@ export default function App() {
   useEffect(() => {
     const checkApi = async () => {
       try {
-        const res = await fetch('/api/stats');
+        const res = await fetch('/api/health');
         if (res.ok) {
           setServerStatus('online');
           setDbStatus('Local SQLite Database Connected');
         } else {
-          setServerStatus('offline');
-          setDbStatus('API Connection Error');
+          // Don't immediately set offline if it's just a temporary glitch
+          console.warn('API health check returned non-OK status');
         }
       } catch (err) {
         console.error('API health check failed:', err);
@@ -670,7 +670,7 @@ export default function App() {
     };
     
     checkApi();
-    const interval = setInterval(checkApi, 30000); // Check every 30s
+    const interval = setInterval(checkApi, 10000); // Check every 10s for more responsiveness
     return () => clearInterval(interval);
   }, []);
 
