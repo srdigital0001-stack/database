@@ -36,6 +36,7 @@ import {
   CloudOff
 } from 'lucide-react';
 import { Client, ServiceType, SERVICE_TYPES, Task } from './types';
+import { supabase } from './lib/supabase';
 import { jsPDF } from 'jspdf';
 import 'jspdf-autotable';
 import * as XLSX from 'xlsx';
@@ -651,26 +652,28 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [serverStatus, setServerStatus] = useState<'online' | 'offline' | 'checking'>('checking');
   const [dbStatus, setDbStatus] = useState<string>('');
+  const [storageInfo, setStorageInfo] = useState<any>(null);
 
   useEffect(() => {
     const checkApi = async () => {
       try {
-        const res = await fetch('/api/health');
-        if (res.ok) {
+        const { data, error } = await supabase.from('clients').select('count', { count: 'exact', head: true });
+        if (!error) {
           setServerStatus('online');
-          setDbStatus('Local SQLite Database Connected');
+          setDbStatus('Supabase Cloud Connected');
         } else {
-          // Don't immediately set offline if it's just a temporary glitch
-          console.warn('API health check returned non-OK status');
+          setServerStatus('offline');
+          setDbStatus('Supabase Error: ' + error.message);
         }
-      } catch (err) {
-        console.error('API health check failed:', err);
+      } catch (err: any) {
+        console.error('Supabase health check failed:', err);
         setServerStatus('offline');
+        setDbStatus('Connection Failed: ' + (err.message || 'Check your internet or Supabase URL'));
       }
     };
     
     checkApi();
-    const interval = setInterval(checkApi, 10000); // Check every 10s for more responsiveness
+    const interval = setInterval(checkApi, 30000); 
     return () => clearInterval(interval);
   }, []);
 
@@ -685,10 +688,19 @@ export default function App() {
 
   const fetchStats = async () => {
     try {
-      const res = await fetch('/api/stats');
-      if (!res.ok) throw new Error('Failed to fetch stats');
-      const data = await res.json();
-      setStats(data);
+      const { data: clientsData, error: clientsError } = await supabase.from('clients').select('*');
+      if (clientsError) throw clientsError;
+
+      const totalRevenue = clientsData.reduce((sum, c) => sum + (c.total_amount || 0), 0);
+      const totalReceived = clientsData.reduce((sum, c) => sum + (c.advance_paid || 0), 0);
+      const pendingBalance = totalRevenue - totalReceived;
+
+      setStats({
+        revenue: { value: totalRevenue, trend: '+0%' },
+        received: { value: totalReceived, trend: '+0%' },
+        pending: { value: pendingBalance },
+        clients: { value: clientsData.length }
+      });
       setServerStatus('online');
     } catch (err: any) {
       console.error('Failed to fetch stats:', err);
@@ -698,10 +710,26 @@ export default function App() {
 
   const fetchTransactions = async () => {
     try {
-      const res = await fetch('/api/transactions');
-      if (!res.ok) throw new Error('Failed to fetch transactions');
-      const data = await res.json();
-      setTransactions(data);
+      const { data, error } = await supabase
+        .from('transactions')
+        .select(`
+          *,
+          clients (
+            name,
+            company
+          )
+        `)
+        .order('created_at', { ascending: false });
+      
+      if (error) throw error;
+      
+      const formattedData = data.map(t => ({
+        ...t,
+        client_name: t.clients?.name,
+        company: t.clients?.company
+      }));
+
+      setTransactions(formattedData);
       setServerStatus('online');
     } catch (err: any) {
       console.error('Failed to fetch transactions:', err);
@@ -714,23 +742,30 @@ export default function App() {
     setError(null);
     setServerStatus('checking');
     try {
-      const res = await fetch('/api/clients');
-      if (!res.ok) throw new Error('Failed to fetch clients');
-      const data = await res.json();
+      const { data, error } = await supabase
+        .from('clients')
+        .select(`
+          *,
+          services (
+            service_type
+          )
+        `)
+        .order('created_at', { ascending: false });
 
-      setClients(data);
+      if (error) throw error;
+
+      const formattedClients = data.map(c => ({
+        ...c,
+        services: c.services.map((s: any) => s.service_type),
+        remaining_balance: (c.total_amount || 0) - (c.advance_paid || 0)
+      }));
+
+      setClients(formattedClients);
       setServerStatus('online');
-      if (data.length > 0) {
-        localStorage.setItem('clientflow_backup', JSON.stringify(data));
-      }
     } catch (err: any) {
       console.error('Failed to fetch clients:', err);
       setServerStatus('offline');
-      setError(err.message || 'Failed to connect to API.');
-      const backup = localStorage.getItem('clientflow_backup');
-      if (backup) {
-        setClients(JSON.parse(backup));
-      }
+      setError(err.message || 'Failed to connect to Supabase.');
     } finally {
       setLoading(false);
     }
@@ -738,11 +773,24 @@ export default function App() {
 
   const fetchTasks = async () => {
     try {
-      const res = await fetch('/api/tasks');
-      if (!res.ok) throw new Error('Failed to fetch tasks');
-      const data = await res.json();
+      const { data, error } = await supabase
+        .from('tasks')
+        .select(`
+          *,
+          clients (
+            name
+          )
+        `)
+        .order('due_date', { ascending: true });
 
-      setTasks(data);
+      if (error) throw error;
+
+      const formattedTasks = data.map(t => ({
+        ...t,
+        client_name: t.clients?.name
+      }));
+
+      setTasks(formattedTasks);
       setServerStatus('online');
     } catch (err: any) {
       console.error('Failed to fetch tasks:', err);
@@ -753,12 +801,8 @@ export default function App() {
   const addTask = async (taskData: any) => {
     setError(null);
     try {
-      const res = await fetch('/api/tasks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(taskData)
-      });
-      if (!res.ok) throw new Error('Failed to add task');
+      const { error } = await supabase.from('tasks').insert([taskData]);
+      if (error) throw error;
 
       fetchTasks();
       fetchClients();
@@ -772,12 +816,12 @@ export default function App() {
     setError(null);
     const newStatus = currentStatus === 'pending' ? 'completed' : 'pending';
     try {
-      const res = await fetch(`/api/tasks/${taskId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: newStatus })
-      });
-      if (!res.ok) throw new Error('Failed to update task');
+      const { error } = await supabase
+        .from('tasks')
+        .update({ status: newStatus })
+        .eq('id', taskId);
+      
+      if (error) throw error;
 
       fetchTasks();
       fetchClients();
@@ -790,10 +834,8 @@ export default function App() {
   const deleteTask = async (id: number) => {
     setError(null);
     try {
-      const res = await fetch(`/api/tasks/${id}`, {
-        method: 'DELETE'
-      });
-      if (!res.ok) throw new Error('Failed to delete task');
+      const { error } = await supabase.from('tasks').delete().eq('id', id);
+      if (error) throw error;
 
       fetchTasks();
       fetchClients();
@@ -889,12 +931,35 @@ export default function App() {
   const addClient = async (formData: any) => {
     setError(null);
     try {
-      const res = await fetch('/api/clients', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData)
-      });
-      if (!res.ok) throw new Error('Failed to add client');
+      const { services, ...clientData } = formData;
+      
+      const { data: client, error: clientError } = await supabase
+        .from('clients')
+        .insert([clientData])
+        .select()
+        .single();
+
+      if (clientError) throw clientError;
+
+      if (services && services.length > 0) {
+        const servicesToInsert = services.map((s: string) => ({
+          client_id: client.id,
+          service_type: s
+        }));
+        const { error: servicesError } = await supabase
+          .from('services')
+          .insert(servicesToInsert);
+        if (servicesError) throw servicesError;
+      }
+
+      // Add initial transaction if advance was paid
+      if (formData.advance_paid > 0) {
+        await supabase.from('transactions').insert([{
+          client_id: client.id,
+          amount: formData.advance_paid,
+          type: 'payment'
+        }]);
+      }
 
       fetchClients();
       fetchStats();
@@ -909,12 +974,25 @@ export default function App() {
   const editClient = async (id: number, formData: any) => {
     setError(null);
     try {
-      const res = await fetch(`/api/clients/${id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData)
-      });
-      if (!res.ok) throw new Error('Failed to update client');
+      const { services, ...clientData } = formData;
+      
+      const { error: clientError } = await supabase
+        .from('clients')
+        .update(clientData)
+        .eq('id', id);
+
+      if (clientError) throw clientError;
+
+      // Update services: delete old and insert new
+      await supabase.from('services').delete().eq('client_id', id);
+      
+      if (services && services.length > 0) {
+        const servicesToInsert = services.map((s: string) => ({
+          client_id: id,
+          service_type: s
+        }));
+        await supabase.from('services').insert(servicesToInsert);
+      }
 
       fetchClients();
       fetchStats();
@@ -928,12 +1006,26 @@ export default function App() {
   const updatePayment = async (clientId: number, advancePaid: number) => {
     setError(null);
     try {
-      const res = await fetch(`/api/payments/${clientId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ advance_paid: advancePaid })
-      });
-      if (!res.ok) throw new Error('Failed to update payment');
+      const client = clients.find(c => c.id === clientId);
+      if (!client) return;
+
+      const paymentDiff = advancePaid - client.advance_paid;
+
+      const { error } = await supabase
+        .from('clients')
+        .update({ advance_paid: advancePaid })
+        .eq('id', clientId);
+
+      if (error) throw error;
+
+      // Record transaction if there's a positive difference
+      if (paymentDiff > 0) {
+        await supabase.from('transactions').insert([{
+          client_id: clientId,
+          amount: paymentDiff,
+          type: 'payment'
+        }]);
+      }
 
       fetchClients();
       fetchStats();
@@ -947,10 +1039,8 @@ export default function App() {
   const deleteClient = async (id: number) => {
     setError(null);
     try {
-      const res = await fetch(`/api/clients/${id}`, {
-        method: 'DELETE'
-      });
-      if (!res.ok) throw new Error('Failed to delete client');
+      const { error } = await supabase.from('clients').delete().eq('id', id);
+      if (error) throw error;
 
       fetchClients();
       setIsDeleteModalOpen(false);
@@ -1109,8 +1199,8 @@ export default function App() {
                 <p className="text-[10px] text-slate-400 font-bold uppercase tracking-tighter flex items-center gap-1">
                   {serverStatus === 'online' ? <Cloud className="w-3 h-3" /> : <CloudOff className="w-3 h-3" />}
                   {serverStatus === 'online' 
-                    ? 'Local Database Active' 
-                    : serverStatus === 'offline' ? 'Sync Error' : 'Checking...'}
+                    ? 'Supabase Cloud Active' 
+                    : dbStatus || 'Sync Error'}
                 </p>
               </div>
             </div>
@@ -1492,7 +1582,7 @@ export default function App() {
                   <Database className="w-6 h-6 text-indigo-400" />
                 </div>
                 <div>
-                  <h3 className="text-xl font-bold text-white">Supabase Cloud Integration</h3>
+                  <h3 className="text-xl font-bold text-white">Supabase Cloud Storage</h3>
                   <p className="text-slate-400 text-sm">Your agency data is securely stored on Supabase Cloud.</p>
                 </div>
               </div>
@@ -1500,7 +1590,7 @@ export default function App() {
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
                 <div className="p-5 rounded-2xl bg-white/5 border border-white/5">
                   <p className="text-indigo-400 font-black text-xs uppercase tracking-widest mb-2">Project ID</p>
-                  <p className="text-white font-mono text-sm">wnmdviybsfszrbionjwi</p>
+                  <p className="text-white font-mono text-sm">boqnsdrkrvanulmxxfye</p>
                 </div>
                 <div className="p-5 rounded-2xl bg-white/5 border border-white/5">
                   <p className="text-emerald-400 font-black text-xs uppercase tracking-widest mb-2">Connection Status</p>
@@ -1510,19 +1600,19 @@ export default function App() {
                   </p>
                 </div>
                 <div className="p-5 rounded-2xl bg-white/5 border border-white/5">
-                  <p className="text-amber-400 font-black text-xs uppercase tracking-widest mb-2">Last Sync</p>
-                  <p className="text-white text-sm">{new Date().toLocaleTimeString()}</p>
+                  <p className="text-amber-400 font-black text-xs uppercase tracking-widest mb-2">Total Records</p>
+                  <p className="text-white text-sm">{clients.length} Clients</p>
                 </div>
               </div>
 
-              <div className="p-6 rounded-2xl bg-indigo-500/10 border border-indigo-500/20">
+              <div className="p-6 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 mb-8">
                 <h4 className="text-white font-bold mb-4 flex items-center gap-2">
                   <TableIcon className="w-5 h-5 text-indigo-400" />
                   Database Setup Instructions
                 </h4>
-                <p className="text-slate-400 text-sm mb-4">If your data is not appearing, ensure you have created the required tables in your Supabase SQL Editor:</p>
+                <p className="text-slate-400 text-sm mb-4">Run this SQL in your Supabase SQL Editor to create the required tables:</p>
                 <pre className="bg-slate-950/50 p-4 rounded-xl text-[10px] text-indigo-300 overflow-x-auto font-mono custom-scrollbar">
-{`-- Run this in Supabase SQL Editor:
+{`-- Create clients table
 CREATE TABLE IF NOT EXISTS clients (
   id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
   name TEXT NOT NULL,
@@ -1532,24 +1622,19 @@ CREATE TABLE IF NOT EXISTS clients (
   notes TEXT,
   managed_by TEXT,
   status TEXT DEFAULT 'active',
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  total_amount REAL DEFAULT 0,
+  advance_paid REAL DEFAULT 0
 );
 
+-- Create services table
 CREATE TABLE IF NOT EXISTS services (
   id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
   client_id BIGINT REFERENCES clients(id) ON DELETE CASCADE,
   service_type TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS payments (
-  id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-  client_id BIGINT REFERENCES clients(id) ON DELETE CASCADE,
-  total_amount REAL DEFAULT 0,
-  advance_paid REAL DEFAULT 0,
-  remaining_balance REAL DEFAULT 0,
-  last_updated TIMESTAMPTZ DEFAULT NOW()
-);
-
+-- Create tasks table
 CREATE TABLE IF NOT EXISTS tasks (
   id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
   client_id BIGINT REFERENCES clients(id) ON DELETE CASCADE,
@@ -1560,6 +1645,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Create transactions table
 CREATE TABLE IF NOT EXISTS transactions (
   id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
   client_id BIGINT REFERENCES clients(id) ON DELETE CASCADE,
@@ -1568,6 +1654,18 @@ CREATE TABLE IF NOT EXISTS transactions (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );`}
                 </pre>
+              </div>
+
+              <div className="flex flex-col sm:flex-row gap-4">
+                <motion.button 
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                  onClick={() => fetchClients()}
+                  className="flex-1 px-8 py-4 rounded-2xl bg-indigo-600 text-white font-black hover:bg-indigo-700 transition-all shadow-xl shadow-indigo-500/25 flex items-center justify-center gap-3"
+                >
+                  <Clock className="w-5 h-5" />
+                  Sync Data Now
+                </motion.button>
               </div>
             </div>
           </div>
